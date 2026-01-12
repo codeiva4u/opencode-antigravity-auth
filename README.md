@@ -544,6 +544,110 @@ Try add this line to in `google` field under `provider`
 ### Error during the session
 If you encounter error during the session, try chat `continue` the recover session mechanism should be trigger and you can continue the session, if the error blocked the session please workaround by use command `/undo` to revert to the state before the error and try again it should work
 
+### Error using Gemini CLI models
+When using Gemini CLI models, you may come across an error with the below text: 
+> Permission 'cloudaicompanion.companions.generateChat' denied on resource '//cloudaicompanion.googleapis.com/projects/rising-fact-p41fc/locations/global' (or it may not exist).
+
+The plugin attempts to provision or find a suitable Google Cloud project when authenticating with Antigravity. If none is found, it defaults to a predefined project ID set by the `ANTIGRAVITY_DEFAULT_PROJECT_ID` variable in this project. While this works for Antigravity, Gemini CLI throws an error because this project ID does not exist in your Google Cloud account.
+
+For it to work, you can follow similar steps in [opencode-gemini-auth](https://github.com/jenslys/opencode-gemini-auth?tab=readme-ov-file#manual-google-cloud-setup):
+* Go to the [Google Cloud Console](https://console.cloud.google.com/).
+* Create or select a project.
+* Enable the Gemini for Google Cloud API (cloudaicompanion.googleapis.com).
+* Configure the projectId in your Opencode config as shown above. 
+
+Then you add the project ID to your `~/.config/opencode/antigravity-accounts.json` setup under your account, you can add it as a `projectId` field:
+```json
+{
+  "version": 3,
+  "accounts": [
+    {
+      "email": "<<your email>>",
+      "refreshToken": "<<your refresher token>>",
+      "projectId": "<<place project ID here>>"
+    }
+  ],
+  "activeIndex": 0,
+  "activeIndexByFamily": {
+    "claude": 0,
+    "gemini": 0
+  }
+}
+```
+
+**Note**: This would have to be done per account if you have a multi-account setup. 
+
+<details>
+<summary><b>Safari OAuth Callback Fails (macOS)</b></summary>
+
+**Symptoms:**
+- "fail to authorize" after successful Google login in browser
+- Safari shows "Safari can't open the page" or connection refused
+- Callback appears to succeed in browser but plugin reports failure
+
+**Cause:** Safari's "HTTPS-Only Mode" (enabled by default in recent macOS versions) blocks the `http://localhost` callback URL used during OAuth authentication.
+
+**Solutions (choose one):**
+
+1. **Use a different browser** (easiest):
+   Copy the URL printed by `opencode auth login` and paste it into Chrome or Firefox instead of Safari.
+
+2. **Temporarily disable HTTPS-Only Mode:**
+   - Safari > Settings (⌘,) > Privacy
+   - Uncheck "Enable HTTPS-Only Mode"
+   - Run `opencode auth login`
+   - Re-enable after successful authentication
+
+3. **Manual callback URL extraction** (advanced):
+   - When Safari shows the error, look at the address bar
+   - The URL should contain `?code=...&scope=...`
+   - This auth code can be used manually (see [issue #119](https://github.com/NoeFabris/opencode-antigravity-auth/issues/119) for updates on manual auth support)
+
+</details>
+
+<details>
+<summary><b>Port Already in Use</b></summary>
+
+If OAuth fails with "Address already in use" or similar port binding errors:
+
+**macOS / Linux:**
+```bash
+# Find what's using the OAuth callback port (usually 8080 or dynamic)
+# Try common ports (8080, 3000, 5000) or omit port for a full list
+lsof -i :8080  # or: lsof -i -P -n | grep LISTEN
+
+# If a stale process is found, terminate it
+kill -9 <PID>
+
+# Retry authentication
+opencode auth login
+```
+
+**Windows (PowerShell / Command Prompt):**
+```powershell
+# Find what's using the port
+netstat -ano | findstr :8080
+
+# Terminate the process (replace <PID> with the actual process ID)
+taskkill /PID <PID> /F
+
+# Retry authentication
+opencode auth login
+```
+
+</details>
+
+<details>
+<summary><b>WSL2 / Remote Development</b></summary>
+
+For users running OpenCode in WSL2 or over SSH:
+- The OAuth callback requires the browser to reach `localhost` on the machine running OpenCode
+- For WSL2: Ensure port forwarding is configured, or use VS Code's port forwarding
+- For SSH: Use SSH port forwarding: `ssh -L 8080:localhost:8080 user@remote`
+- For headless servers: See [issue #119](https://github.com/NoeFabris/opencode-antigravity-auth/issues/119) for manual URL auth (in development)
+
+</details>
+
 ## Known Plugin Interactions
 
 ### @tarquinen/opencode-dcp
