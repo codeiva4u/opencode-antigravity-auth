@@ -106,10 +106,15 @@ jobs:
         run: |
           cat << 'EOF' > triage_prompt.txt
           ## Role
-          You are an expert triage assistant AND a master user of opencode-antigravity-auth.
-          You know this plugin inside-out: the README, architecture, common issues, and troubleshooting steps.
-          You are extremely helpful and want to solve users problems quickly.
-          
+          You are an expert software engineer and triage specialist for the opencode-antigravity-auth project.
+          Your GOAL is to investigate the issue, identify the root cause, and provide a helpful response.
+
+          ## Capabilities & Constraints
+          - ✅ **INVESTIGATE:** You CAN and SHOULD use tools (grep, read, ls) to explore the codebase, verify error messages, and check configurations.
+          - ❌ **NO COMMITS:** You are running in a CI/CD triage environment. Do NOT attempt to push code, create PRs, or modify files permanently.
+          - ✅ **REPORT:** If you identify a fix, describe it in detail in the `suggested_response` field so the developer can apply it.
+          - 🏁 **MANDATORY:** Your FINAL action MUST be to output the JSON classification object. Do not exit without it.
+
           **IMPORTANT: Always respond in English, regardless of the language of the issue.**
           
           This is an OpenCode plugin that enables OAuth authentication with Googles Antigravity API to access models like Claude Opus 4.5, Claude Sonnet 4.5, and Gemini 3 Pro.
@@ -160,13 +165,13 @@ jobs:
           - area/compat: Compatibility with OpenCode, DCP
 
           ## Task
-          1. Select ONE type label
-          2. Select ONE area label  
-          3. Check if this is a DUPLICATE of another open issue (check the list above!)
-          4. Provide a helpful response IN ENGLISH if you can solve the issue
+          1. Investigate the issue using your tools if necessary.
+          2. Select ONE type label and ONE area label.
+          3. Check for DUPLICATES.
+          4. Provide a `suggested_response` that includes your technical findings and guidance.
 
           ## Output (ONLY valid JSON, no markdown, no code blocks)
-          {"type_label": "bug", "area_label": "area/auth", "duplicate_of": null, "suggested_response": "This looks like an expired OAuth token. Try running gemini auth login to refresh your credentials."}
+          {"type_label": "bug", "area_label": "area/auth", "duplicate_of": null, "suggested_response": "I investigated the code and found that..."}
           EOF
 
       - name: 'Triage with Jules API'
@@ -266,7 +271,8 @@ jobs:
               }],
               \"generationConfig\": {
                 \"temperature\": 0.1,
-                \"maxOutputTokens\": 1024
+                \"maxOutputTokens\": 8192,
+                \"responseMimeType\": \"application/json\"
               }
             }")
           
