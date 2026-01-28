@@ -189,6 +189,9 @@ export interface AccountMetadataV3 {
   cooldownReason?: CooldownReason;
   /** Per-account device fingerprint for rate limit mitigation */
   fingerprint?: import("./fingerprint").Fingerprint;
+  /** Cached soft quota data */
+  cachedQuota?: Record<string, { remainingFraction?: number; resetTime?: string; modelCount: number }>;
+  cachedQuotaUpdatedAt?: number;
 }
 
 export interface AccountStorageV3 {

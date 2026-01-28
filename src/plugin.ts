@@ -33,7 +33,7 @@ import { EmptyResponseError } from "./plugin/errors";
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
 import { clearAccounts, loadAccounts, saveAccounts } from "./plugin/storage";
-import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs } from "./plugin/accounts";
+import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, computeSoftQuotaCacheTtlMs } from "./plugin/accounts";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
 import { loadConfig, initRuntimeConfig, type AntigravityConfig } from "./plugin/config";
 import { createSessionRecoveryHook, getRecoverySuccessToast } from "./plugin/recovery";
@@ -46,6 +46,7 @@ import { executeSearch } from "./plugin/search";
 import type {
   GetAuth,
   LoaderResult,
+  PluginClient,
   PluginContext,
   PluginResult,
   ProjectContextResult,
@@ -99,6 +100,51 @@ function shouldShowRateLimitToast(message: string): boolean {
 
 function resetAllAccountsRateLimitedToast(): void {
   allAccountsRateLimitedToastShown = false;
+}
+
+const quotaRefreshInProgressByEmail = new Set<string>();
+
+async function triggerAsyncQuotaRefreshForAccount(
+  accountManager: AccountManager,
+  accountIndex: number,
+  client: PluginClient,
+  providerId: string,
+  intervalMinutes: number,
+): Promise<void> {
+  if (intervalMinutes <= 0) return;
+  
+  const accounts = accountManager.getAccounts();
+  const account = accounts[accountIndex];
+  if (!account || account.enabled === false) return;
+  
+  const accountKey = account.email ?? `idx-${accountIndex}`;
+  if (quotaRefreshInProgressByEmail.has(accountKey)) return;
+  
+  const intervalMs = intervalMinutes * 60 * 1000;
+  const age = account.cachedQuotaUpdatedAt != null 
+    ? Date.now() - account.cachedQuotaUpdatedAt 
+    : Infinity;
+  
+  if (age < intervalMs) return;
+  
+  quotaRefreshInProgressByEmail.add(accountKey);
+  
+  try {
+    const accountsForCheck = accountManager.getAccountsForQuotaCheck();
+    const singleAccount = accountsForCheck[accountIndex];
+    if (!singleAccount) return;
+    
+    const results = await checkAccountsQuota([singleAccount], client, providerId);
+    
+    if (results[0]?.status === "ok" && results[0]?.quota?.groups) {
+      accountManager.updateQuotaCache(accountIndex, results[0].quota.groups);
+      accountManager.requestSaveToDisk();
+    }
+  } catch (err) {
+    log.debug(`quota-refresh-failed email=${accountKey}`, { error: String(err) });
+  } finally {
+    quotaRefreshInProgressByEmail.delete(accountKey);
+  }
 }
 
 function trackWarmupAttempt(sessionId: string): boolean {
@@ -1031,15 +1077,52 @@ export const createAntigravityPlugin = (providerId: string) => async (
               throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
             }
 
+            const softQuotaCacheTtlMs = computeSoftQuotaCacheTtlMs(
+              config.soft_quota_cache_ttl_minutes,
+              config.quota_refresh_interval_minutes,
+            );
+
             const account = accountManager.getCurrentOrNextForFamily(
               family, 
               model, 
               config.account_selection_strategy,
               'antigravity',
               config.pid_offset_enabled,
+              config.soft_quota_threshold_percent,
+              softQuotaCacheTtlMs,
             );
             
             if (!account) {
+              if (accountManager.areAllAccountsOverSoftQuota(family, config.soft_quota_threshold_percent, softQuotaCacheTtlMs, model)) {
+                const threshold = config.soft_quota_threshold_percent;
+                const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(family, threshold, softQuotaCacheTtlMs, model);
+                const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
+                
+                if (softQuotaWaitMs === null || (maxWaitMs > 0 && softQuotaWaitMs > maxWaitMs)) {
+                  const waitTimeFormatted = softQuotaWaitMs ? formatWaitTime(softQuotaWaitMs) : "unknown";
+                  await showToast(
+                    `All accounts over ${threshold}% quota threshold. Resets in ${waitTimeFormatted}.`,
+                    "error"
+                  );
+                  throw new Error(
+                    `Quota protection: All ${accountCount} account(s) are over ${threshold}% usage for ${family}. ` +
+                    `Quota resets in ${waitTimeFormatted}. ` +
+                    `Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.`
+                  );
+                }
+                
+                const waitSecValue = Math.max(1, Math.ceil(softQuotaWaitMs / 1000));
+                pushDebug(`all-over-soft-quota family=${family} accounts=${accountCount} waitMs=${softQuotaWaitMs}`);
+                
+                if (!allAccountsRateLimitedToastShown) {
+                  await showToast(`All ${accountCount} account(s) over ${threshold}% quota. Waiting ${formatWaitTime(softQuotaWaitMs)}...`, "warning");
+                  allAccountsRateLimitedToastShown = true;
+                }
+                
+                await sleep(softQuotaWaitMs, abortSignal);
+                continue;
+              }
+
               const headerStyle = getHeaderStyleFromUrl(urlString, family);
               const explicitQuota = isExplicitQuotaFromUrl(urlString);
               // All accounts are rate-limited - wait and retry
@@ -1645,6 +1728,14 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   account.consecutiveFailures = 0;
                   getHealthTracker().recordSuccess(account.index);
                   accountManager.markAccountUsed(account.index);
+                  
+                  void triggerAsyncQuotaRefreshForAccount(
+                    accountManager,
+                    account.index,
+                    client,
+                    providerId,
+                    config.quota_refresh_interval_minutes,
+                  );
                 }
                 logAntigravityDebugResponse(debugContext, response, {
                   note: response.ok ? "Success" : `Error ${response.status}`,
@@ -1907,6 +1998,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 if (menuResult.mode === "check") {
                   console.log("\nChecking quotas for all accounts...");
                   const results = await checkAccountsQuota(existingStorage.accounts, client, providerId);
+                  let storageUpdated = false;
                   for (const res of results) {
                     const label = res.email || `Account ${res.index + 1}`;
                     const disabledStr = res.disabled ? " (disabled)" : "";
@@ -1931,10 +2023,24 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     printGrp("Claude", res.quota.groups.claude);
                     printGrp("Gemini 3 Pro", res.quota.groups["gemini-pro"]);
                     printGrp("Gemini 3 Flash", res.quota.groups["gemini-flash"]);
-                    if (res.updatedAccount) {
-                      existingStorage.accounts[res.index] = res.updatedAccount;
-                      await saveAccounts(existingStorage);
+                    
+                    const acc = existingStorage.accounts[res.index];
+                    if (acc && res.quota.groups) {
+                      acc.cachedQuota = res.quota.groups;
+                      acc.cachedQuotaUpdatedAt = Date.now();
+                      storageUpdated = true;
                     }
+                    if (res.updatedAccount) {
+                      existingStorage.accounts[res.index] = {
+                        ...res.updatedAccount,
+                        cachedQuota: res.quota.groups,
+                        cachedQuotaUpdatedAt: Date.now(),
+                      };
+                      storageUpdated = true;
+                    }
+                  }
+                  if (storageUpdated) {
+                    await saveAccounts(existingStorage);
                   }
                   console.log("");
                   continue;
