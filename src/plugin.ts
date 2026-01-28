@@ -33,7 +33,7 @@ import { EmptyResponseError } from "./plugin/errors";
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
 import { clearAccounts, loadAccounts, saveAccounts } from "./plugin/storage";
-import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs } from "./plugin/accounts";
+import { AccountManager, type ModelFamily, parseRateLimitReason, calculateBackoffMs, computeSoftQuotaCacheTtlMs } from "./plugin/accounts";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
 import { loadConfig, initRuntimeConfig, type AntigravityConfig } from "./plugin/config";
 import { createSessionRecoveryHook, getRecoverySuccessToast } from "./plugin/recovery";
@@ -46,6 +46,7 @@ import { executeSearch } from "./plugin/search";
 import type {
   GetAuth,
   LoaderResult,
+  PluginClient,
   PluginContext,
   PluginResult,
   ProjectContextResult,
@@ -71,8 +72,9 @@ const rateLimitToastCooldowns = new Map<string, number>();
 const RATE_LIMIT_TOAST_COOLDOWN_MS = 5000;
 const MAX_TOAST_COOLDOWN_ENTRIES = 100;
 
-// Track if "all accounts rate-limited" toast was shown to prevent spam in while loop
-let allAccountsRateLimitedToastShown = false;
+// Track if "all accounts blocked" toasts were shown to prevent spam in while loop
+let softQuotaToastShown = false;
+let rateLimitToastShown = false;
 
 function cleanupToastCooldowns(): void {
   if (rateLimitToastCooldowns.size > MAX_TOAST_COOLDOWN_ENTRIES) {
@@ -97,8 +99,57 @@ function shouldShowRateLimitToast(message: string): boolean {
   return true;
 }
 
-function resetAllAccountsRateLimitedToast(): void {
-  allAccountsRateLimitedToastShown = false;
+function resetAllAccountsBlockedToasts(): void {
+  softQuotaToastShown = false;
+  rateLimitToastShown = false;
+}
+
+const quotaRefreshInProgressByEmail = new Set<string>();
+
+async function triggerAsyncQuotaRefreshForAccount(
+  accountManager: AccountManager,
+  accountIndex: number,
+  client: PluginClient,
+  providerId: string,
+  intervalMinutes: number,
+): Promise<void> {
+  if (intervalMinutes <= 0) return;
+  
+  const accounts = accountManager.getAccounts();
+  const account = accounts[accountIndex];
+  if (!account || account.enabled === false) return;
+  
+  const accountKey = account.email ?? `idx-${accountIndex}`;
+  if (quotaRefreshInProgressByEmail.has(accountKey)) return;
+  
+  const intervalMs = intervalMinutes * 60 * 1000;
+  const age = account.cachedQuotaUpdatedAt != null 
+    ? Date.now() - account.cachedQuotaUpdatedAt 
+    : Infinity;
+  
+  if (age < intervalMs) return;
+  
+  quotaRefreshInProgressByEmail.add(accountKey);
+  
+  try {
+    const accountsForCheck = accountManager.getAccountsForQuotaCheck();
+    const singleAccount = accountsForCheck[accountIndex];
+    if (!singleAccount) {
+      quotaRefreshInProgressByEmail.delete(accountKey);
+      return;
+    }
+    
+    const results = await checkAccountsQuota([singleAccount], client, providerId);
+    
+    if (results[0]?.status === "ok" && results[0]?.quota?.groups) {
+      accountManager.updateQuotaCache(accountIndex, results[0].quota.groups);
+      accountManager.requestSaveToDisk();
+    }
+  } catch (err) {
+    log.debug(`quota-refresh-failed email=${accountKey}`, { error: String(err) });
+  } finally {
+    quotaRefreshInProgressByEmail.delete(accountKey);
+  }
 }
 
 function trackWarmupAttempt(sessionId: string): boolean {
@@ -1031,15 +1082,52 @@ export const createAntigravityPlugin = (providerId: string) => async (
               throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
             }
 
+            const softQuotaCacheTtlMs = computeSoftQuotaCacheTtlMs(
+              config.soft_quota_cache_ttl_minutes,
+              config.quota_refresh_interval_minutes,
+            );
+
             const account = accountManager.getCurrentOrNextForFamily(
               family, 
               model, 
               config.account_selection_strategy,
               'antigravity',
               config.pid_offset_enabled,
+              config.soft_quota_threshold_percent,
+              softQuotaCacheTtlMs,
             );
             
             if (!account) {
+              if (accountManager.areAllAccountsOverSoftQuota(family, config.soft_quota_threshold_percent, softQuotaCacheTtlMs, model)) {
+                const threshold = config.soft_quota_threshold_percent;
+                const softQuotaWaitMs = accountManager.getMinWaitTimeForSoftQuota(family, threshold, softQuotaCacheTtlMs, model);
+                const maxWaitMs = (config.max_rate_limit_wait_seconds ?? 300) * 1000;
+                
+                if (softQuotaWaitMs === null || (maxWaitMs > 0 && softQuotaWaitMs > maxWaitMs)) {
+                  const waitTimeFormatted = softQuotaWaitMs ? formatWaitTime(softQuotaWaitMs) : "unknown";
+                  await showToast(
+                    `All accounts over ${threshold}% quota threshold. Resets in ${waitTimeFormatted}.`,
+                    "error"
+                  );
+                  throw new Error(
+                    `Quota protection: All ${accountCount} account(s) are over ${threshold}% usage for ${family}. ` +
+                    `Quota resets in ${waitTimeFormatted}. ` +
+                    `Add more accounts, wait for quota reset, or set soft_quota_threshold_percent: 100 to disable.`
+                  );
+                }
+                
+                const waitSecValue = Math.max(1, Math.ceil(softQuotaWaitMs / 1000));
+                pushDebug(`all-over-soft-quota family=${family} accounts=${accountCount} waitMs=${softQuotaWaitMs}`);
+                
+                if (!softQuotaToastShown) {
+                  await showToast(`All ${accountCount} account(s) over ${threshold}% quota. Waiting ${formatWaitTime(softQuotaWaitMs)}...`, "warning");
+                  softQuotaToastShown = true;
+                }
+                
+                await sleep(softQuotaWaitMs, abortSignal);
+                continue;
+              }
+
               const headerStyle = getHeaderStyleFromUrl(urlString, family);
               const explicitQuota = isExplicitQuotaFromUrl(urlString);
               // All accounts are rate-limited - wait and retry
@@ -1079,9 +1167,9 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 );
               }
 
-              if (!allAccountsRateLimitedToastShown) {
+              if (!rateLimitToastShown) {
                 await showToast(`All ${accountCount} account(s) rate-limited for ${family}. Waiting ${waitSecValue}s...`, "warning");
-                allAccountsRateLimitedToastShown = true;
+                rateLimitToastShown = true;
               }
 
               // Wait for the rate-limit cooldown to expire, then retry
@@ -1090,7 +1178,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
             }
 
             // Account is available - reset the toast flag
-            resetAllAccountsRateLimitedToast();
+            resetAllAccountsBlockedToasts();
 
             pushDebug(
               `selected idx=${account.index} email=${account.email ?? ""} family=${family} accounts=${accountCount} strategy=${config.account_selection_strategy}`,
@@ -1652,6 +1740,14 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   account.consecutiveFailures = 0;
                   getHealthTracker().recordSuccess(account.index);
                   accountManager.markAccountUsed(account.index);
+                  
+                  void triggerAsyncQuotaRefreshForAccount(
+                    accountManager,
+                    account.index,
+                    client,
+                    providerId,
+                    config.quota_refresh_interval_minutes,
+                  );
                 }
                 logAntigravityDebugResponse(debugContext, response, {
                   note: response.ok ? "Success" : `Error ${response.status}`,
@@ -1914,6 +2010,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 if (menuResult.mode === "check") {
                   console.log("\n📊 Checking quotas for all accounts...\n");
                   const results = await checkAccountsQuota(existingStorage.accounts, client, providerId);
+                  let storageUpdated = false;
                   
                   for (const res of results) {
                     const label = res.email || `Account ${res.index + 1}`;
@@ -2016,10 +2113,27 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     }
                     console.log("");
 
-                    if (res.updatedAccount) {
-                      existingStorage.accounts[res.index] = res.updatedAccount;
-                      await saveAccounts(existingStorage);
+                    // Cache quota data for soft quota protection
+                    if (res.quota?.groups) {
+                      const acc = existingStorage.accounts[res.index];
+                      if (acc) {
+                        acc.cachedQuota = res.quota.groups;
+                        acc.cachedQuotaUpdatedAt = Date.now();
+                        storageUpdated = true;
+                      }
                     }
+
+                    if (res.updatedAccount) {
+                      existingStorage.accounts[res.index] = {
+                        ...res.updatedAccount,
+                        cachedQuota: res.quota?.groups,
+                        cachedQuotaUpdatedAt: Date.now(),
+                      };
+                      storageUpdated = true;
+                    }
+                  }
+                  if (storageUpdated) {
+                    await saveAccounts(existingStorage);
                   }
                   console.log("");
                   continue;
