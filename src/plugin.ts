@@ -843,6 +843,11 @@ export const createAntigravityPlugin = (providerId: string) => async (
         isChildSession = true;
         childSessionParentID = props.info.parentID;
         log.debug("child-session-detected", { parentID: props.info.parentID });
+      } else {
+        // Reset for root sessions - important when plugin instance is reused
+        isChildSession = false;
+        childSessionParentID = undefined;
+        log.debug("root-session-detected", {});
       }
     }
     
